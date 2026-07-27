@@ -1,202 +1,295 @@
 # Shiki
 
-> 面向 Android 的安全远程 AI 编程 Agent。
+> 面向个人开发者的本地优先 AI 编程任务系统：任务在你自己的 Host 上执行，Android 负责随身控制。
 
-Shiki 旨在让开发者通过 Android 手机创建和管理 AI 编码任务。代码与开发工具运行在远程 Ubuntu 工作区中；Agent 在隔离的 Docker 容器内读取、修改和测试 GitHub 仓库，并在用户审查和确认后创建 Draft Pull Request。
+Shiki 不是托管式 AI 编程 SaaS。核心 **Shiki Host/Daemon** 运行在用户自己的电脑、开发机、家庭服务器或个人 VPS 上，负责项目、任务、凭据、执行和 GitHub 交付；Android 应用通过设备配对连接 Host，用于创建任务、查看进度、审查 Diff、确认操作和接收结果。
 
 > [!WARNING]
-> Shiki 目前处于设计与技术验证阶段，尚未达到生产可用状态，不建议用于高敏感代码或关键业务仓库。
+> Shiki 目前处于设计与技术验证阶段，尚未达到生产可用状态。请勿将其用于高敏感代码、关键业务仓库或无法承受凭据泄露与错误修改风险的环境。
+
+## 产品边界
+
+- **本地优先：** Host 上的本地状态是唯一事实来源，首版使用本地文件和追加写入的 JSONL 事件日志持久化。
+- **用户自托管执行：** 代码、Coding CLI、构建和测试均在用户控制的设备上运行，不使用 Shiki 提供的共享执行集群。
+- **无中心身份系统：** 不要求 Shiki 中心账号、注册、成员、组织或邀请，也不依赖中心数据库。
+- **移动端是控制端：** Android 不承载代码执行，也不是任务状态的唯一保存位置。
+- **直接连接优先：** 手机完成设备配对后，通过局域网或用户自建 VPN 访问 Host，并使用 HTTPS/WSS 传输控制请求和事件。
+- **可选 Relay 仅是未来方向：** 未来可能提供端到端加密的消息中继，以解决无法直连的问题；Relay 不应看到明文任务、代码或凭据，也不保存权威任务状态、不执行任务。
+- **人工交付：** 用户最终确认前不向 GitHub 推送任务改动；确认后只创建 Draft PR，不自动转为 Ready、不自动合并。
+
+## MVP 范围
+
+首版刻意限制为：
+
+- Host：Windows 11 + WSL2 + Docker Desktop，或原生 Ubuntu + Docker Engine；
+- 控制端：Android；
+- 代码托管：GitHub；
+- Agent：接通并验证一个真实 Provider；
+- 并发：每个 Host 同时只运行一个任务；
+- 存储：本地文件、状态快照和追加 JSONL，不引入中心数据库；
+- 交付：用户确认后由 Host 创建 GitHub Draft PR。
+
+首版不以完整移动 IDE、多人协作、公共注册与计费、多 Provider、多任务并发、自动合并或通用云端执行平台为目标。
 
 ## 核心能力（规划中）
 
-- 通过 Android 创建、监控、暂停和取消编码任务
-- 支持流式对话、结构化工具事件和只读命令日志
-- 在手机锁屏、切换应用或短暂断网后继续执行服务器任务
-- 展示代码 Diff、测试结果、模型用量和估算费用
-- 对删除文件、扩大网络权限和推送代码等高风险操作进行分级审批
-- 使用 GitHub App 实现最小权限仓库授权
-- 每个任务运行在独立、受限且可清理的 Docker 容器中
-- 用户使用自己的 Anthropic API Key，不共享模型额度
-- 经用户最终确认后创建 Draft Pull Request，不自动合并代码
+- 从 GitHub Issue 或用户直接输入创建编程任务；
+- 在 Android 上查看流式消息、结构化事件、命令日志、Diff、测试结果和任务状态；
+- 为每个任务创建独立 Git worktree 和一次性 Task Container；
+- 在容器中运行真实 Coding CLI，修改代码并执行构建、测试和检查；
+- 在协议确实支持时提供工具事件、取消、用量信息和执行前审批；
+- 对不具备可靠细粒度审批能力的 Provider 显式降级，而不是伪装支持；
+- 手机断线后由 Host 独立继续任务，并在重连后按事件序号补传；
+- 最终确认前展示完整 Diff、验证结果和交付计划；
+- 由 Host 完成 Git/GitHub 写操作，并且只创建 Draft PR；
+- 将 GitHub CI 与 Review 状态回流到 Host 和 Android。
 
 ## 系统架构
 
 ```text
-┌──────────────────────────────┐
-│ Android Client               │
-│ Kotlin + Jetpack Compose     │
-└──────────────┬───────────────┘
-               │ HTTPS / WebSocket
-               ▼
-┌──────────────────────────────┐
-│ NestJS API                   │
-│ Auth · Tasks · Approvals     │
-│ GitHub App · Event Stream    │
-└──────────┬───────────┬───────┘
-           │           │
-           ▼           ▼
-┌────────────────┐  ┌────────────────────┐
-│ PostgreSQL     │  │ Worker (systemd)   │
-│ Prisma         │  │ Git · Docker · SDK │
-└────────────────┘  └──────────┬─────────┘
-                               │
-                               ▼
-                    ┌────────────────────┐
-                    │ Isolated Container │
-                    │ Claude · Node.js   │
-                    │ Python · Workspace │
-                    └────────────────────┘
+┌──────────────────────────────────────┐
+│ Android Client                       │
+│ 任务 · 事件 · Diff · 审批 · 最终确认 │
+└──────────────────┬───────────────────┘
+                   │ 设备配对 + HTTPS/WSS
+                   │ LAN / 用户自建 VPN
+                   │ （未来：可选 E2EE Relay）
+                   ▼
+┌──────────────────────────────────────────────────────┐
+│ 用户自己的 Shiki Host/Daemon                         │
+│                                                      │
+│ 连接与设备认证   任务编排   策略/能力判断             │
+│ 本地状态文件     JSONL 事件  Provider Adapter         │
+│ Git/worktree     GitHub 集成 凭据与发布控制           │
+└───────────────┬───────────────────────┬───────────────┘
+                │                       │ Host 持有凭据并执行
+                │ 创建/挂载 task        │ clone/fetch/worktree/
+                │ worktree              │ commit/push/Draft PR
+                ▼                       ▼
+┌──────────────────────────────┐   ┌────────────────────┐
+│ 一次性 Task Container        │   │ GitHub             │
+│ 真实 Coding CLI              │   │ Issue · PR · CI    │
+│ 项目工具链 · 构建 · 测试     │   │ Review             │
+│ 无 GitHub Token / Docker API │   └────────────────────┘
+└──────────────────────────────┘
 ```
 
-Android 客户端负责交互、审批和状态展示；API 服务负责身份、权限与任务状态；独立 Worker 管理 Git 操作、Agent 生命周期和 Docker 容器。GitHub 凭证由 Worker 使用，不暴露给任务容器。
+Host 是控制面和安全决策点。它创建 worktree、启动和销毁容器、保存事件、管理 Provider 会话，并负责所有需要 GitHub 凭据的操作。任务容器只获得任务工作目录、必要工具和受控配置；它可以修改工作树，但不负责 `commit`、`push` 或创建 PR。
 
-## 技术栈
+## 主流程
+
+```text
+GitHub Issue / 用户任务
+  → Host 获取仓库并创建独立 worktree
+  → Host 启动一次性 Task Container
+  → Provider Adapter 在容器中运行真实 Coding CLI
+  → Agent 修改代码，Host 收集事件、Diff 与测试结果
+  → Android 展示结果，用户作最终确认
+  → Host 创建提交、推送任务分支并创建 Draft PR
+  → GitHub CI / Review 状态回流 Host 与 Android
+```
+
+用户拒绝最终确认时，Host 不推送任务改动，也不创建 PR。后续是否保留 worktree、重新运行 Agent 或清理任务，由用户在 Host 策略允许的范围内决定。
+
+## Provider Adapter 与能力降级
+
+不同 Coding CLI 的公开接口、事件质量和恢复能力差异很大。Shiki 按以下顺序选择集成方式：
+
+1. **官方结构化协议：** 优先使用 Provider 明确支持的 SDK、ACP、JSON-RPC 或等价协议；
+2. **CLI JSON/JSONL：** 在官方 CLI 提供有文档、可版本约束的机器可读输出时使用；
+3. **PTY 兼容：** 最后才以伪终端驱动交互式 CLI，作为兼容路径。
+
+每个 Adapter 必须声明经过验证的能力，例如结构化流、工具调用事件、执行前审批、取消、会话恢复和用量统计。Host 只启用实际可用的功能：
+
+- 不声称所有 CLI 都提供完整 API；
+- 不把终端文本解析包装成“可靠审批”；
+- PTY 或事件不完整时，只提供任务启动、容器权限、网络策略和最终发布等外层控制；
+- 如果无法在工具执行前确定性拦截，就禁用对应细粒度审批界面，并明确告知用户；
+- Adapter 失去协议兼容性时应快速失败，不能静默放宽权限。
+
+无论使用哪一层，安全边界都不能只依赖 Provider 自报事件或 Agent 自觉遵守提示词。
+
+## 任务生命周期与恢复
+
+```text
+Created
+  → Queued
+  → Preparing
+  → Running
+  → Waiting for Approval（仅在可靠支持时）
+  → Validating
+  → Waiting for Final Confirmation
+  → Publishing
+  → Draft PR Created
+  → Watching CI / Review
+  → Completed
+
+任意执行状态 → Failed / Cancelled / Interrupted
+```
+
+- **手机断线：** 不会中止 Host 上已运行的任务；不需要用户输入时任务继续，等待确认时保持等待状态。Android 重连后按任务事件序号补取遗漏事件。
+- **Host 关机、休眠或 Daemon 停止：** 任务不能继续运行，并进入中断或待恢复状态。
+- **Host 恢复后：** Shiki 可以从本地状态、JSONL 日志、worktree 和产物重建任务视图，但 Provider 会话能否原地恢复取决于其协议和 CLI。无法恢复时只能启动新会话继续现有工作树或由用户重试，不能承诺无缝续跑。
+- **任务取消：** Host 可以停止容器并保留已有日志与 Diff；Provider 是否支持优雅取消由 Adapter 能力决定。
+
+## 本地持久化
+
+首版不使用 PostgreSQL 或其他中心数据库。计划中的 Host 数据布局概念如下，实际路径和格式会在实现时版本化：
+
+```text
+~/.shiki/
+├── config/                 # Host 与已配对设备配置
+├── projects/               # 本地项目元数据
+├── tasks/<task-id>/
+│   ├── state.json          # 可重建的任务状态快照
+│   ├── events.jsonl        # 只追加事件流
+│   └── artifacts/          # Diff、测试摘要等任务产物
+└── worktrees/<task-id>/    # 每任务独立 worktree
+```
+
+事件写入需要递增序号、格式版本和崩溃恢复策略。快照是读取优化，JSONL 事件和工作区共同用于恢复与审计。GitHub Token、Provider 凭据等秘密不得写入任务 JSONL 或普通状态文件。
+
+## 安全模型与限制
+
+Shiki 将仓库内容、依赖安装脚本、Agent 输出和任务容器内进程都视为不可信输入。
+
+- **设备身份：** Android 通过一次性配对建立设备密钥；私钥保存在 Android Keystore，Host 维护可撤销的配对设备列表。Shiki 不依赖中心账号判断设备权限。
+- **传输边界：** 优先在可信 LAN 或用户自建 VPN 内连接，并使用 HTTPS/WSS。不要将未加固的 Daemon 直接暴露到公网。
+- **Host 权威：** 容器和 Agent 不能自行批准权限、发布代码或修改 Host 策略。最终确认必须由 Host 验证已配对设备的请求。
+- **GitHub 凭据：** GitHub Token、OAuth 凭据或 `gh` 登录信息只保留在 Host，绝不注入任务容器。clone/fetch、分支、提交、push 和 Draft PR 操作均由 Host 侧受控代码完成。
+- **Provider 凭据：** 真实 Coding CLI 可能要求 API Key、OAuth Token 或会话文件进入同一个任务容器。即使使用短时注入、只读挂载或最小权限，恶意仓库代码或同容器进程仍可能窃取这些凭据。容器不能隔离“同容器内的凭据与代码”；应优先使用可撤销、短期、低权限凭据，并避免复用高价值账号会话。
+- **容器隔离：** 每任务使用一次性、非 root、受资源限制的容器，不挂载 Docker Socket、Host 凭据目录或无关路径，并尽量限制网络出口。
+- **隔离声明：** Task Container 用于缩小错误或恶意操作的影响范围，不是虚拟机或硬件级绝对安全边界；Docker、内核、挂载和配置漏洞仍可能影响 Host。
+- **审批边界：** 只有 Provider 协议提供可靠的执行前钩子时，才能把细粒度工具审批作为控制措施。否则以容器权限、Host 操作边界、网络策略和最终确认兜底。
+- **交付边界：** 用户最终确认前不向 GitHub 推送任务修改；确认后只创建 Draft PR，永不自动合并。
+- **日志与脱敏：** 日志应避免记录秘密，并对常见 Token 和私钥模式做尽力脱敏；脱敏不能保证识别所有敏感数据。
+
+运行 Shiki 意味着信任自己的 Host 操作系统、Docker/WSL2 环境、所选 Provider 及其凭据机制。对高风险仓库，应使用单独设备、虚拟机或更强隔离，而不是仅依赖任务容器。
+
+## 计划技术栈
 
 | 层级 | 计划技术 |
 | --- | --- |
-| Android 客户端 | Kotlin、Jetpack Compose、Android Keystore |
-| API 服务 | TypeScript、Node.js、NestJS |
-| Agent 执行器 | 独立 Worker、systemd、Docker Engine |
-| Agent 接口 | 优先验证 Claude Agent SDK / Claude Code 官方结构化接口 |
-| 数据库 | PostgreSQL、Prisma |
-| 实时通信 | REST API、WebSocket、事件序号补传 |
-| GitHub 集成 | GitHub App、OAuth、Webhook、Draft Pull Request |
-| 管理界面 | React、Vite、TypeScript |
-| Monorepo | pnpm workspace、Gradle |
+| Android | Kotlin、Jetpack Compose、Android Keystore |
+| Host/Daemon | TypeScript、Node.js、本地 HTTP API 与任务编排 |
+| 实时通信 | HTTPS、WSS、递增事件序号与断线补传 |
+| 本地存储 | 版本化 JSON、追加 JSONL、本地文件系统 |
+| 任务执行 | Git worktree、Docker Engine / Docker Desktop、一次性容器 |
+| Provider 集成 | 官方 SDK/ACP/JSON-RPC → CLI JSON/JSONL → PTY |
+| GitHub 集成 | Host 侧 Git、GitHub API/CLI、Draft PR、CI/Review 状态同步 |
 | API 契约 | OpenAPI、版本化 JSON Schema |
-| 反向代理 | Caddy（待部署方案确认） |
-| CI/CD | GitHub Actions、版本化 Docker 镜像、签名 APK |
-| 监控与告警 | 结构化日志、基础指标、外部监控、飞书告警 |
-| 备份 | 加密 PostgreSQL 备份、S3 类对象存储 |
+| 工程组织 | pnpm workspace、Gradle |
+| CI | GitHub Actions、Host/Android 测试、任务镜像构建 |
 
-## 安全设计原则
-
-Shiki 将不可信仓库内容和 Agent 操作视为潜在风险输入，而不是默认可信代码。
-
-- **最小权限：** GitHub App 只申请读取代码、写入任务分支和创建 Draft PR 所需权限。
-- **任务隔离：** 每个任务使用独立容器、工作区和非 root Linux 身份。
-- **凭证隔离：** GitHub Token 留在 Worker；Anthropic API Key 加密保存，并尽量只提供给 Claude 进程。
-- **确定性审批：** 后端策略引擎决定允许、拒绝或要求审批，Agent 不能覆盖策略。
-- **资源限制：** 限制 CPU、内存、进程数、磁盘和任务运行时间。
-- **网络控制：** 原型阶段允许联网；团队试用前切换为必要服务白名单和临时域名审批。
-- **审计与脱敏：** 保存任务事件和审批记录，对已知 Token、私钥和常见敏感字段自动脱敏。
-- **安全交付：** 推送前执行 Diff 审查、测试结果展示、依赖检查和密钥扫描。
-- **人工合并：** Shiki 只创建 Draft PR，不自动转为 Ready，也不自动合并。
-
-Docker 能降低错误命令和恶意代码的影响范围，但不等同于虚拟机级别的绝对安全边界。
-
-## 任务生命周期
-
-```text
-Queued
-  → Preparing
-  → Running
-  → Waiting for Approval
-  → Running
-  → Validating
-  → Waiting for Final Confirmation
-  → Draft PR Created
-  → Completed / Failed / Cancelled / Interrupted
-```
-
-任务具有持久状态。Android 断线后，服务端继续执行；客户端重连时使用每任务递增事件序号补取遗漏消息。审批等待最多保留 24 小时，执行时间默认限制为 60 分钟。
+技术选型仍需通过探针确认；表中内容是实现方向，不代表对应能力已经完成。
 
 ## 第一阶段技术验证
 
-正式开发完整产品前，项目将优先验证 Claude 官方结构化接口是否能够可靠提供：
+完整产品开发前，项目将使用一个真实 Provider 完成端到端探针，重点验证：
 
-- 流式 Agent 消息
-- 工具调用开始和结束事件
-- 工具执行前的审批拦截
-- 批准与拒绝操作
-- 任务取消
-- 工作目录约束
-- Token 与费用用量
-- 受限 Docker 容器内运行
+- 在任务容器中启动、交互和终止真实 Coding CLI；
+- 官方结构化协议是否稳定提供消息、工具事件、退出状态和错误；
+- 执行前审批是否确实发生在工具运行之前，而不是事后通知；
+- CLI JSON/JSONL 的版本、错误流、部分行和异常退出行为；
+- PTY 模式对提示、确认、终端尺寸、颜色和断线的兼容性上限；
+- 取消、超时、Daemon 重启和 Provider 会话恢复的实际语义；
+- worktree、一次性容器、资源限制和清理流程；
+- GitHub Token 不进入容器，Provider 凭据暴露范围符合明确声明；
+- Android 断线重连、事件补传和重复请求幂等性；
+- 最终确认之前无法 push，确认后只能创建 Draft PR；
+- 在 Windows 11 + WSL2/Docker Desktop 与原生 Ubuntu 上行为一致。
 
-该探针设置 20 个开发工时的决策门槛。如果官方接口无法可靠实现执行前审批，将停止当前内核路线，转入基于 Anthropic API 的受控 Agent 循环方案评审，而不是解析脆弱的终端文本输出。
+探针结果将形成 Adapter 能力矩阵。结构化接口不足时依次降级到 JSON/JSONL 和 PTY；任何无法可靠实现的审批、恢复或用量能力都应在 MVP 中关闭并标注，而不是通过脆弱解析制造保证。
 
 ## 路线图
 
-1. **SDK 探针与执行内核**
-   - Claude 结构化接口、Worker、Docker、PostgreSQL、测试 CLI、核心审批和 Diff
-2. **GitHub 与身份链路**
-   - GitHub App、邀请登录、仓库权限、任务分支和 Draft PR
-3. **Android 核心流程**
-   - 任务创建、聊天、状态、通知、审批、Diff 和最终确认
-4. **安全运维与管理**
-   - 网络策略、凭证保护、备份、监控、审计、Web 管理页和紧急停止
-5. **邀请制小团队试用**
-   - 完成安全回归和恢复演练后开放内部测试
-6. **轻量代码编辑器**
-   - 文件树、搜索、小文件编辑、草稿、哈希检测和冲突处理
+1. **技术探针与协议定型**
+   - 验证一个真实 Provider、三层 Adapter、容器运行、事件模型与恢复边界。
+2. **Host 单任务内核**
+   - 本地 JSON/JSONL、任务状态机、worktree、一次性容器、Diff/测试和清理。
+3. **GitHub 交付闭环**
+   - Issue 输入、Host 凭据隔离、最终确认、Draft PR、CI/Review 回流。
+4. **Android MVP**
+   - 设备配对、任务创建、事件流、Diff、审批能力提示、最终确认和通知。
+5. **跨平台加固**
+   - Windows 11 + WSL2/Docker Desktop 与原生 Ubuntu 的安装、升级、崩溃恢复和安全测试。
+6. **后续能力**
+   - 在 MVP 稳定后评估更多 Provider、多任务并发及可选 E2EE Relay；这些能力不进入首版承诺。
 
 ## 计划中的仓库结构
 
 ```text
 shiki/
 ├── apps/
-│   ├── android/
-│   ├── api/
-│   ├── worker/
-│   └── admin-web/
+│   ├── android/                 # Android 移动控制端
+│   └── host/                    # 本地 Host/Daemon
 ├── packages/
-│   ├── database/
-│   ├── observability/
-│   ├── policy/
-│   └── protocol/
+│   ├── protocol/                # Android ↔ Host 契约与事件 Schema
+│   ├── task-model/              # 状态机、本地存储与恢复
+│   ├── provider-adapters/       # 结构化、JSON/JSONL、PTY Adapter
+│   ├── execution/               # worktree、容器与策略
+│   └── github/                  # Host 侧 GitHub 集成
 ├── tools/
-│   ├── shiki-admin/
-│   └── test-cli/
+│   └── provider-probe/          # 真实 Provider 能力探针
 ├── images/
-│   └── task-runtime/
-├── fixtures/
-│   └── sample-repository/
-└── deploy/
+│   └── task-runtime/            # 一次性任务镜像
+└── fixtures/
+    └── sample-repository/       # 隔离、Diff 与恢复测试仓库
 ```
 
-此结构是规划方案，目录会在对应开发阶段逐步建立。
+该结构是规划，不表示目录和实现已经存在。项目不计划增加中心账号服务、中心业务数据库或共享任务 Worker 集群。
 
 ## 开发环境
 
-计划使用以下环境进行开发和验收：
+MVP 的开发与验收矩阵：
 
-- Windows 11 + WSL2 Ubuntu
-- Docker Desktop（WSL2 Backend）
-- Node.js + pnpm
-- PostgreSQL
-- Android Studio
-- 真实 Ubuntu Server 作为最终部署和安全验收环境
+### Windows Host
 
-开发环境和正式服务器必须使用不同的数据库、API Key、加密主密钥和管理入口。
+- Windows 11；
+- WSL2 Ubuntu；
+- Docker Desktop，启用 WSL2 Backend；
+- Host/Daemon 运行在 WSL2 Linux 环境中；
+- Android Studio 与 Android 模拟器或实体设备。
+
+### Ubuntu Host
+
+- 受支持的 Ubuntu LTS；
+- Docker Engine；
+- Git、Node.js LTS 与 pnpm；
+- Android 客户端通过 LAN、VPN 和 WSS 连接。
+
+### 通用要求
+
+- Android Studio、JDK 与 Android SDK；
+- 独立的 GitHub 测试仓库和最小权限凭据；
+- 用于探针的真实 Provider 账号与可撤销凭据；
+- 测试环境与个人日常凭据、生产仓库分离。
+
+当前仓库仍处于设计阶段，尚无可运行的安装或启动命令。实现建立后将补充可复现的环境检查、构建、测试和卸载流程。
 
 ## 项目状态
 
-- [x] 产品目标与总体架构设计
-- [x] 初步安全模型与分阶段路线
-- [ ] Claude SDK 能力探针
-- [ ] 执行内核原型
-- [ ] GitHub App 与身份链路
-- [ ] Android MVP
-- [ ] 安全运维与邀请制试用
-
-Shiki 是当前内部代号，正式产品名称和 Android `applicationId` 尚未确定。
+- [x] 确认本地优先、个人自托管的产品定位
+- [x] 确认 Android 控制端、Host 执行端与 GitHub Draft PR 主流程
+- [x] 确认本地 JSON/JSONL、每任务 worktree 与一次性容器方向
+- [x] 明确 Provider Adapter 降级策略和安全声明边界
+- [ ] 完成一个真实 Provider 的协议与容器探针
+- [ ] 实现 Host 单任务执行内核
+- [ ] 实现 GitHub 最终确认与 Draft PR 闭环
+- [ ] 实现 Android 配对与核心任务流程
+- [ ] 完成 Windows/Ubuntu 恢复与安全验收
 
 ## 文档
 
-后续计划补充：
+- [总体设计文档](docs/DESIGN.md)
+- [开发工具与环境配置清单](docs/DEVELOPMENT_SETUP.md)
 
-- 产品需求文档（PRD）
-- 架构决策记录（ADR）
-- 威胁模型
-- 本地开发指南
-- 部署与恢复手册
-- 安全披露流程
+现有设计文档仍在向本 README 的本地优先架构同步；如内容冲突，以本 README 描述的当前产品定位和边界为准。
 
 ## Contributing
 
-项目目前处于私有原型阶段，暂未开放外部贡献流程。
+项目处于早期设计与验证阶段，外部贡献流程尚未定型。在提交实现前，请先通过 Issue 说明目标、威胁边界和验证方式；涉及 Provider 能力时必须附带真实探针结果，不能仅依据 CLI 外观或未验证假设声明支持。
 
 ## License
 
-MIT
+许可证尚未确定。在许可证文件正式加入仓库前，不授予复制、分发或再许可本项目代码的权利。
