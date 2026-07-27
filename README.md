@@ -2,7 +2,7 @@
 
 > 面向个人开发者的本地优先 AI 编程任务系统：任务在你自己的 Host 上执行，Android 负责随身控制。
 
-Shiki 不是托管式 AI 编程 SaaS。核心 **Shiki Host/Daemon** 运行在用户自己的电脑、开发机、家庭服务器或个人 VPS 上，负责项目、任务、凭据、执行和 GitHub 交付；Android 应用通过设备配对连接 Host，用于创建任务、查看进度、审查 Diff、确认操作和接收结果。
+Shiki 不是托管式 AI 编程 SaaS。用户自己的电脑、开发机、家庭服务器或个人 VPS 是 **Host**；运行在其上的 **Shiki Daemon** 负责项目、任务、凭据、执行和 GitHub 交付。Android 应用通过设备配对连接 Daemon，用于创建任务、查看 Timeline、审查 Diff、确认操作和接收结果。
 
 > [!WARNING]
 > Shiki 目前处于设计与技术验证阶段，尚未达到生产可用状态。请勿将其用于高敏感代码、关键业务仓库或无法承受凭据泄露与错误修改风险的环境。
@@ -56,8 +56,9 @@ Shiki 不是托管式 AI 编程 SaaS。核心 **Shiki Host/Daemon** 运行在用
                    │ （未来：可选 E2EE Relay）
                    ▼
 ┌──────────────────────────────────────────────────────┐
-│ 用户自己的 Shiki Host/Daemon                         │
+│ 用户自己的 Host                                      │
 │                                                      │
+│ Shiki Daemon                                         │
 │ 连接与设备认证   任务编排   策略/能力判断             │
 │ 本地状态文件     JSONL 事件  Provider Adapter         │
 │ Git/worktree     GitHub 集成 凭据与发布控制           │
@@ -74,7 +75,7 @@ Shiki 不是托管式 AI 编程 SaaS。核心 **Shiki Host/Daemon** 运行在用
 └──────────────────────────────┘
 ```
 
-Host 是控制面和安全决策点。它创建 worktree、启动和销毁容器、保存事件、管理 Provider 会话，并负责所有需要 GitHub 凭据的操作。任务容器只获得任务工作目录、必要工具和受控配置；它可以修改工作树，但不负责 `commit`、`push` 或创建 PR。
+Host 是控制面和安全决策点。它创建 worktree、启动和销毁容器、保存 Timeline、管理 Provider 会话，并负责所有需要 GitHub 凭据的操作。任务容器只获得任务工作目录、必要工具和受控配置；它可以修改工作树，但不负责 `commit`、`push` 或创建 PR。Docker 是 MVP 容器任务的必需能力；不可用或未通过策略检查时，Daemon 应拒绝任务，不静默改为直接在 Host 运行仓库代码。
 
 ## 主流程
 
@@ -82,14 +83,14 @@ Host 是控制面和安全决策点。它创建 worktree、启动和销毁容器
 GitHub Issue / 用户任务
   → Host 获取仓库并创建独立 worktree
   → Host 启动一次性 Task Container
-  → Provider Adapter 在容器中运行真实 Coding CLI
+  → Shiki Daemon 通过 Provider Adapter 驱动容器中的真实 Coding CLI
   → Agent 修改代码，Host 收集事件、Diff 与测试结果
   → Android 展示结果，用户作最终确认
   → Host 创建提交、推送任务分支并创建 Draft PR
   → GitHub CI / Review 状态回流 Host 与 Android
 ```
 
-用户拒绝最终确认时，Host 不推送任务改动，也不创建 PR。后续是否保留 worktree、重新运行 Agent 或清理任务，由用户在 Host 策略允许的范围内决定。
+用户拒绝最终确认时，Host 不推送任务改动，也不创建 PR；Task 以“本地结果、未发布”完成。后续是否保留 worktree、基于该结果创建关联的新 Task 或清理，由用户在 Host 策略允许的范围内决定。
 
 ## Provider Adapter 与能力降级
 
@@ -112,20 +113,20 @@ GitHub Issue / 用户任务
 ## 任务生命周期与恢复
 
 ```text
-Created
-  → Queued
-  → Preparing
-  → Running
-  → Waiting for Approval（仅在可靠支持时）
-  → Validating
-  → Waiting for Final Confirmation
-  → Publishing
-  → Draft PR Created
-  → Watching CI / Review
-  → Completed
+CREATED
+  → QUEUED
+  → PREPARING
+  → RUNNING
+      ↔ WAITING_FOR_APPROVAL（仅在可靠支持时）
+  → VALIDATING
+  → WAITING_FOR_FINAL_CONFIRMATION
+      ├──确认──▶ PUBLISHING → COMPLETED
+      └──拒绝──▶ COMPLETED（本地结果，不发布）
 
-任意执行状态 → Failed / Cancelled / Interrupted
+任意非终态 → FAILED / CANCELLED / INTERRUPTED
 ```
+
+GitHub Draft PR 创建并持久化链接后，Task 可以进入 `COMPLETED`；用户拒绝发布时也以“本地结果、未发布”完成。后续 Checks、Review、Merged 或 Closed 作为独立 Delivery 投影继续同步，不长期占用 Host 的唯一执行名额。
 
 - **手机断线：** 不会中止 Host 上已运行的任务；不需要用户输入时任务继续，等待确认时保持等待状态。Android 重连后按任务事件序号补取遗漏事件。
 - **Host 关机、休眠或 Daemon 停止：** 任务不能继续运行，并进入中断或待恢复状态。
@@ -147,7 +148,7 @@ Created
 └── worktrees/<task-id>/    # 每任务独立 worktree
 ```
 
-事件写入需要递增序号、格式版本和崩溃恢复策略。快照是读取优化，JSONL 事件和工作区共同用于恢复与审计。GitHub Token、Provider 凭据等秘密不得写入任务 JSONL 或普通状态文件。
+这是便于说明的数据概念图；Linux/WSL2 的实际实现将按 XDG 将配置、持久数据、运行状态、缓存和临时锁分开，具体路径以[总体设计文档](docs/DESIGN.md)与平台路径模块为准。事件写入需要递增序号、格式版本和崩溃恢复策略。快照是读取优化，JSONL 事件和工作区共同用于恢复与审计。GitHub Token、Provider 凭据等秘密不得写入任务 JSONL 或普通状态文件。
 
 ## 安全模型与限制
 
@@ -171,7 +172,7 @@ Shiki 将仓库内容、依赖安装脚本、Agent 输出和任务容器内进�
 | 层级 | 计划技术 |
 | --- | --- |
 | Android | Kotlin、Jetpack Compose、Android Keystore |
-| Host/Daemon | TypeScript、Node.js、本地 HTTP API 与任务编排 |
+| Shiki Daemon | TypeScript、Node.js、本地 HTTPS API 与任务编排 |
 | 实时通信 | HTTPS、WSS、递增事件序号与断线补传 |
 | 本地存储 | 版本化 JSON、追加 JSONL、本地文件系统 |
 | 任务执行 | Git worktree、Docker Engine / Docker Desktop、一次性容器 |
@@ -203,18 +204,22 @@ Shiki 将仓库内容、依赖安装脚本、Agent 输出和任务容器内进�
 
 ## 路线图
 
-1. **技术探针与协议定型**
-   - 验证一个真实 Provider、三层 Adapter、容器运行、事件模型与恢复边界。
-2. **Host 单任务内核**
-   - 本地 JSON/JSONL、任务状态机、worktree、一次性容器、Diff/测试和清理。
-3. **GitHub 交付闭环**
+1. **设计与工程基线**
+   - 固化文档、Monorepo 骨架、固定工具链、Schema 和测试入口。
+2. **Provider、Git 与容器探针**
+   - 验证一个真实 Provider、三层 Adapter、worktree、容器、凭据与恢复边界。
+3. **Daemon 单任务内核**
+   - 本地 JSON/JSONL、状态机、worktree、一次性容器、Diff/测试和清理。
+4. **设备配对与本地协议**
+   - Host 身份、设备撤销、HTTPS/WSS、Timeline 补传、幂等和离线语义。
+5. **GitHub 交付闭环**
    - Issue 输入、Host 凭据隔离、最终确认、Draft PR、CI/Review 回流。
-4. **Android MVP**
-   - 设备配对、任务创建、事件流、Diff、审批能力提示、最终确认和通知。
-5. **跨平台加固**
+6. **Android MVP**
+   - 多 Host、任务创建、Timeline、Diff、能力提示、最终确认和通知。
+7. **跨平台与安全加固**
    - Windows 11 + WSL2/Docker Desktop 与原生 Ubuntu 的安装、升级、崩溃恢复和安全测试。
-6. **后续能力**
-   - 在 MVP 稳定后评估更多 Provider、多任务并发及可选 E2EE Relay；这些能力不进入首版承诺。
+8. **后续能力评审**
+   - MVP 稳定后评估更多 Provider、多任务并发、可选 E2EE Relay 和轻量编辑器。
 
 ## 计划中的仓库结构
 
@@ -222,19 +227,23 @@ Shiki 将仓库内容、依赖安装脚本、Agent 输出和任务容器内进�
 shiki/
 ├── apps/
 │   ├── android/                 # Android 移动控制端
-│   └── host/                    # 本地 Host/Daemon
+│   └── daemon/                  # Host 上的 Shiki Daemon
 ├── packages/
-│   ├── protocol/                # Android ↔ Host 契约与事件 Schema
-│   ├── task-model/              # 状态机、本地存储与恢复
+│   ├── protocol/                # OpenAPI、JSON Schema 与生成模型
+│   ├── daemon-core/             # 任务、Timeline、确认和恢复状态机
+│   ├── host-platform/           # 路径、进程、文件、Git 与 Docker 适配
 │   ├── provider-adapters/       # 结构化、JSON/JSONL、PTY Adapter
-│   ├── execution/               # worktree、容器与策略
-│   └── github/                  # Host 侧 GitHub 集成
+│   ├── github/                  # Host 侧 GitHub 集成
+│   └── security/                # 配对、策略、路径、脱敏和密钥扫描
 ├── tools/
-│   └── provider-probe/          # 真实 Provider 能力探针
-├── images/
-│   └── task-runtime/            # 一次性任务镜像
-└── fixtures/
-    └── sample-repository/       # 隔离、Diff 与恢复测试仓库
+│   ├── provider-probe/          # 真实 Provider 能力探针
+│   └── protocol-probe/          # 配对、WSS 与 Timeline 测试客户端
+├── container/
+│   └── task/                    # 一次性 Task Container 镜像
+└── tests/
+    └── fixtures/
+        ├── sample-repository/   # 正常执行与交付样本
+        └── hostile-repositories/ # 恶意仓库安全回归样本
 ```
 
 该结构是规划，不表示目录和实现已经存在。项目不计划增加中心账号服务、中心业务数据库或共享任务 Worker 集群。
@@ -248,7 +257,7 @@ MVP 的开发与验收矩阵：
 - Windows 11；
 - WSL2 Ubuntu；
 - Docker Desktop，启用 WSL2 Backend；
-- Host/Daemon 运行在 WSL2 Linux 环境中；
+- Shiki Daemon 运行在 WSL2 Linux 环境中；
 - Android Studio 与 Android 模拟器或实体设备。
 
 ### Ubuntu Host
@@ -281,10 +290,10 @@ MVP 的开发与验收矩阵：
 
 ## 文档
 
-- [总体设计文档](docs/DESIGN.md)
-- [开发工具与环境配置清单](docs/DEVELOPMENT_SETUP.md)
+- [总体设计文档](docs/DESIGN.md)：产品边界、架构、安全模型、状态与路线图；
+- [开发工具与环境配置清单](docs/DEVELOPMENT_SETUP.md)：Windows/WSL2、Ubuntu、Android、Provider 与容器开发基线。
 
-现有设计文档仍在向本 README 的本地优先架构同步；如内容冲突，以本 README 描述的当前产品定位和边界为准。
+三份文档共同采用本地优先的 Personal daemon + Container runner + GitHub loop 基线；若后续决策改变产品或安全边界，应在同一变更中同步文档并补充 ADR。
 
 ## Contributing
 
